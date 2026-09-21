@@ -1,0 +1,17 @@
+{
+  // Merge this plugin entry into your trusted OpenCode V2 configuration.
+  "plugins": [
+    {
+      "package": "/absolute/path/to/opencode-tool-review",
+      "options": {
+        "model": { "providerID": "YOUR_PROVIDER_ID", "id": "YOUR_REVIEW_MODEL_ID" },
+        "policy": "Production host: no service changes, destructive operations, or secret disclosure.",
+        "maxRisk": "low",
+        "maxSteps": 4,
+        "timeoutMs": 30000,
+        "maxConcurrent": 4,
+        "evidenceFiles": []
+      }
+    }
+  ]
+}
