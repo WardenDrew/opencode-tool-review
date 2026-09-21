@@ -7,7 +7,7 @@ import plugin, { configuration } from '../src/index.js';
 import { makeInspector } from '../src/evidence.js';
 import { parseReply } from '../src/reviewer.js';
 
-const allow = (overrides = {}) => ({ text: JSON.stringify({ type: 'decision', decision: 'allow', risk: 'low', authorized: true, reason: 'bounded read', ...overrides }) });
+const allow = (overrides = {}) => ({ text: JSON.stringify({ type: 'decision', decision: 'allow', risk: 'low', authorized: true, reason: 'bounded read', analysis: 'The request is a read within the workspace.', ...overrides }) });
 const options = { model: { providerID: 'test', id: 'reviewer' } };
 const event = (tool = 'shell', input = { command: 'fixture-only' }) => ({ tool, input, sessionID: 'ses_test', messageID: 'msg_test', id: 'call_test', agent: 'build' });
 const shell = () => ({ command: 'fixture-only', cwd: '/workspace', shell: '/bin/sh', timeout: 1000, env: { SECRET: 'must-not-leak' } });
@@ -15,10 +15,11 @@ const shell = () => ({ command: 'fixture-only', cwd: '/workspace', shell: '/bin/
 async function harness({ generate = async () => allow(), settings = options, messages = [{ type: 'user', text: 'Inspect the workspace.' }], directory = '/workspace' } = {}) {
   const hooks = new Map();
   const prompts = [];
+  const audits = [];
   const ctx = {
     app: { version: '2.0.11' }, options: settings, location: { directory },
     generate: { text: async input => { prompts.push(input); return generate(input); } },
-    session: { context: async () => messages },
+    session: { context: async () => messages, synthetic: async input => { audits.push(input); } },
   };
   for (const domain of ['tool', 'shell']) ctx[domain] = {
     hook: async (name, handler) => {
@@ -33,7 +34,7 @@ async function harness({ generate = async () => allow(), settings = options, mes
     await hooks.get(`${domain}.${domain === 'tool' ? 'execute' : 'create'}.before`)(value);
     executions++;
   };
-  return { ctx, invoke, prompts, cleanup, executions: () => executions };
+  return { ctx, invoke, prompts, audits, cleanup, executions: () => executions };
 }
 
 test('every tool name and each shell creation must pass review', async () => {
@@ -43,6 +44,23 @@ test('every tool name and each shell creation must pass review', async () => {
   assert.equal(h.prompts.length, 8);
   assert.equal(h.executions(), 8);
   assert.equal(h.prompts[0].model.id, 'reviewer');
+  assert.equal(h.audits.length, 7);
+  assert.match(h.audits[0].text, /Reviewer analysis: The request is a read/);
+  assert.equal(h.audits[0].resume, false);
+});
+
+test('session audit records denial and evidence requests', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-review-audit-'));
+  await writeFile(path.join(directory, 'evidence.txt'), 'fixture');
+  let calls = 0;
+  const h = await harness({ directory, settings: { ...options, evidenceFiles: ['evidence.txt'] }, generate: async () =>
+    ++calls === 1 ? { text: '{"type":"inspect","file":"evidence.txt"}' } : allow({
+      decision: 'deny', reason: 'policy violation', analysis: 'The inspected evidence shows the action exceeds policy.' }) });
+  await assert.rejects(h.invoke('tool', event()), /policy violation/);
+  assert.equal(h.executions(), 0);
+  assert.equal(h.audits.length, 1);
+  assert.match(h.audits[0].text, /Reviewer result: deny; risk: low; user intent covered: true/);
+  assert.match(h.audits[0].text, /Evidence requested: evidence.txt/);
 });
 
 test('deny and ask stop execution, even for dangerous strings stored only as data', async () => {
@@ -58,7 +76,14 @@ test('deny and ask stop execution, even for dangerous strings stored only as dat
 test('strict schema rejects malformed, ambiguous, or non-JSON output', () => {
   for (const text of ['allow', '{}', 'null', '[]', '```json\n{}\n```', '<think>ok</think>{}',
     allow({ authorized: 'true' }).text, allow({ extra: true }).text, allow({ risk: 'unknown' }).text,
-    allow({ reason: '' }).text, 'x'.repeat(12001)]) assert.throws(() => parseReply(text));
+    allow({ reason: '' }).text, allow({ analysis: '' }).text, 'x'.repeat(12001)]) assert.throws(() => parseReply(text));
+});
+
+test('an allowed tool is blocked when its audit cannot be written', async () => {
+  const h = await harness();
+  h.ctx.session.synthetic = async () => { throw new Error('audit storage unavailable'); };
+  await assert.rejects(h.invoke('tool', event()), /review failed/);
+  assert.equal(h.executions(), 0);
 });
 
 test('risk and authorization are enforced by code', async () => {
@@ -75,6 +100,16 @@ test('risk and authorization are enforced by code', async () => {
   assert.equal(h.executions(), 1);
 });
 
+test('user intent cannot turn a high-risk denial into an approval', async () => {
+  const h = await harness({ settings: { ...options, maxRisk: 'medium' }, generate: async () => allow({
+    decision: 'deny', risk: 'high', authorized: true,
+    reason: 'policy forbids disclosure', analysis: 'The user requested the action, but the policy prohibits it.',
+  }) });
+  await assert.rejects(h.invoke('tool', event('write', { filePath: 'secret.txt', content: 'fixture' })), /deny: policy forbids disclosure/);
+  assert.equal(h.executions(), 0);
+  assert.match(h.audits[0].text, /deny; risk: high; user intent covered: true/);
+});
+
 test('unavailable provider and malformed context fail closed without leaking details', async () => {
   const h = await harness({ generate: async () => { throw new Error('credential-secret'); } });
   await assert.rejects(h.invoke('tool', event()), error => !error.message.includes('credential-secret'));
@@ -88,6 +123,7 @@ test('misconfiguration keeps blocking hooks installed', async () => {
     const h = await harness({ settings });
     await assert.rejects(h.invoke('tool', event()), /misconfigured/);
     await assert.rejects(h.invoke('shell', shell()), /misconfigured/);
+    assert.equal(h.audits.length, 1);
   }
   assert.throws(() => configuration({ ...options, evidenceFiles: ['../secret'] }));
 });

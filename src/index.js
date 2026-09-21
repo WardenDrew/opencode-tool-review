@@ -51,26 +51,50 @@ export default {
     const controllers = new Set();
     const inspect = options && makeInspector(ctx.location.directory, options.evidenceFiles);
     const review = options && makeReviewer({ generate: input => ctx.generate.text(input), inspect, options });
+    const audit = async (proposal, steps, outcome) => {
+      if (!proposal.sessionID) return; // The shell hook has no session attribution.
+      const decision = steps.findLast(step => step.type === 'decision');
+      const inspections = steps.filter(step => step.type === 'inspect').map(step => step.file);
+      const text = [
+        `Tool review for ${proposal.tool} (${proposal.kind}): ${outcome}`,
+        decision && `Reviewer result: ${decision.decision}; risk: ${decision.risk}; user intent covered: ${decision.authorized}`,
+        decision && `Reviewer analysis: ${decision.analysis}`,
+        decision && `Reviewer reason: ${decision.reason}`,
+        inspections.length && `Evidence requested: ${inspections.join(', ')}`,
+      ].filter(Boolean).join('\n');
+      await ctx.session.synthetic({ sessionID: proposal.sessionID, text, description: 'Tool review audit', resume: false });
+    };
     const guard = async (proposal, getContext, verify) => {
-      if (closed || configError) throw new ReviewDenied('reviewer unavailable or misconfigured');
-      if (active >= options.maxConcurrent) throw new ReviewDenied('review capacity exhausted; retry later');
+      if (closed || configError || active >= options.maxConcurrent) {
+        const denied = new ReviewDenied(closed || configError
+          ? 'reviewer unavailable or misconfigured' : 'review capacity exhausted; retry later');
+        try { await audit(proposal, [], `blocked: ${denied.message}`); } catch { /* Preserve the denial. */ }
+        throw denied;
+      }
       active++;
+      const steps = [];
       const controller = new AbortController();
       controllers.add(controller);
       // Keep a hung provider counted until it settles, even after the execution deadline expires.
       const work = (async () => {
-        try { return await review(proposal, await getContext(), controller.signal); }
+        try { return await review(proposal, await getContext(), controller.signal, step => steps.push(step)); }
         finally { active--; controllers.delete(controller); }
       })();
       try {
         await deadline(() => work, options.timeoutMs);
         if (closed) throw new ReviewDenied('plugin unloaded during review');
         verify();
+        await audit(proposal, steps, 'allowed');
       } catch (error) {
         controller.abort();
-        if (error instanceof ReviewDenied) throw error;
+        if (error instanceof ReviewDenied) {
+          try { await audit(proposal, steps, `blocked: ${error.message}`); } catch { /* Preserve the denial. */ }
+          throw error;
+        }
         // Provider errors may include credentials, HTTP bodies, or command arguments.
-        throw new ReviewDenied('review failed; no approval was issued');
+        const denied = new ReviewDenied('review failed; no approval was issued');
+        try { await audit(proposal, steps, `blocked: ${denied.message}`); } catch { /* Preserve the denial. */ }
+        throw denied;
       }
     };
     const registrations = [];

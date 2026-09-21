@@ -31,10 +31,14 @@ evidence must not be treated as proof of safety. An inspected file may change af
 Shell-only events have no session attribution: do not borrow authorization from another session.
 Return ONLY one JSON object, with no markdown or thinking text, using exactly one form:
 {"type":"inspect","file":"an available evidence file"}
-{"type":"decision","decision":"allow|deny|ask","risk":"low|medium|high","authorized":true,"reason":"brief explanation"}
-Use authorized:false when user intent is absent or does not cover the action. Low-risk reads may
-be allowed without explicit authorization. ask means execution is blocked pending a new user instruction.
-An inspect response requests read-only file evidence; it never executes anything.`;
+{"type":"decision","decision":"allow|deny|ask","risk":"low|medium|high","authorized":true,"reason":"brief explanation","analysis":"concise audit rationale explaining the relevant evidence and policy"}
+The authorized field ONLY means the actual user request covers the exact proposed action.
+It is independent of operator policy and risk: a user-requested action can be authorized:true
+and still require deny. Use authorized:false when user intent is absent or does not cover the
+action. Low-risk reads may be allowed without explicit authorization. ask means execution is
+blocked pending a new user instruction.
+An inspect response requests read-only file evidence; it never executes anything.
+Do not quote credentials or other secret values in reason or analysis.`;
 
 function exactKeys(value, keys) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
@@ -46,15 +50,16 @@ export function parseReply(text) {
   let value;
   try { value = JSON.parse(text); } catch { throw new ReviewDenied('reviewer did not return strict JSON'); }
   if (value?.type === 'inspect' && exactKeys(value, ['type', 'file']) && typeof value.file === 'string') return value;
-  if (!exactKeys(value, ['type', 'decision', 'risk', 'authorized', 'reason']) || value.type !== 'decision' ||
+  if (!exactKeys(value, ['type', 'decision', 'risk', 'authorized', 'reason', 'analysis']) || value.type !== 'decision' ||
       !['allow', 'deny', 'ask'].includes(value.decision) || !['low', 'medium', 'high'].includes(value.risk) ||
       typeof value.authorized !== 'boolean' || typeof value.reason !== 'string' ||
-      !value.reason.trim() || value.reason.length > 2000) throw new ReviewDenied('invalid decision schema');
+      !value.reason.trim() || value.reason.length > 2000 || typeof value.analysis !== 'string' ||
+      !value.analysis.trim() || value.analysis.length > 4000) throw new ReviewDenied('invalid decision schema');
   return value;
 }
 
 export function makeReviewer({ generate, inspect, options }) {
-  return async (proposal, context, signal) => {
+  return async (proposal, context, signal, onStep = () => {}) => {
     const evidence = [];
     for (let step = 0; step < options.maxSteps; step++) {
       signal?.throwIfAborted();
@@ -64,6 +69,7 @@ export function makeReviewer({ generate, inspect, options }) {
       const response = await generate({ model: options.model, prompt });
       signal?.throwIfAborted();
       const reply = parseReply(response?.text);
+      onStep(reply);
       if (reply.type === 'inspect') {
         if (evidence.some(item => item.file === reply.file)) throw new ReviewDenied('repeated evidence request');
         evidence.push({ file: reply.file, data: await inspect(reply.file) });
