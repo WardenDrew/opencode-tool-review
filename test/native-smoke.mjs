@@ -74,7 +74,7 @@ try {
   assert.ok(await until(active));
   const marker = async () => readFile(markerFile, 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; });
   for (const decision of ['deny', 'allow', 'deny']) {
-    await writeFile(decisionFile, JSON.stringify({ type: 'decision', decision, risk: 'low', authorized: true, reason: 'native fixture', analysis: 'The harmless no-op is the only command under review.' }));
+    await writeFile(decisionFile, JSON.stringify({ type: 'decision', decision, risk: 'low', effect: 'read', authorized: true, reason: 'native fixture', analysis: 'The harmless no-op is the only command under review.' }));
     const before = await marker();
     const result = await request('/api/shell', { command: ':', cwd: path.join(root, 'work'), timeout: 1000 });
     assert.ok(result.status >= 400, 'Stop hook must prevent native process creation');

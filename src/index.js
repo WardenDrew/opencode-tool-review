@@ -9,7 +9,7 @@ export function configuration(raw) {
   if (!model || typeof model.providerID !== 'string' || !model.providerID.trim() ||
       typeof model.id !== 'string' || !model.id.trim() || Object.keys(model).some(k => !['providerID', 'id'].includes(k)))
     throw new Error('tool-review requires model: { providerID, id }');
-  const value = { model, policy: '', maxRisk: 'low', maxSteps: 4, timeoutMs: 30_000, maxConcurrent: 4, evidenceFiles: [], ...raw };
+  const value = { model, policy: '', maxRisk: 'medium', maxSteps: 4, timeoutMs: 30_000, maxConcurrent: 4, evidenceFiles: [], ...raw };
   if (!['low', 'medium'].includes(value.maxRisk) || typeof value.policy !== 'string' || value.policy.length > 8000)
     throw new Error('Invalid tool-review policy');
   for (const [key, max] of [['maxSteps', 8], ['timeoutMs', 120_000], ['maxConcurrent', 32]])
@@ -57,12 +57,18 @@ export default {
       const inspections = steps.filter(step => step.type === 'inspect').map(step => step.file);
       const text = [
         `Tool review for ${proposal.tool} (${proposal.kind}): ${outcome}`,
-        decision && `Reviewer result: ${decision.decision}; risk: ${decision.risk}; user intent covered: ${decision.authorized}`,
+        decision && `Reviewer result: ${decision.decision}; risk: ${decision.risk}; effect: ${decision.effect}; user intent covered: ${decision.authorized}`,
         decision && `Reviewer analysis: ${decision.analysis}`,
         decision && `Reviewer reason: ${decision.reason}`,
         inspections.length && `Evidence requested: ${inspections.join(', ')}`,
       ].filter(Boolean).join('\n');
-      await ctx.session.synthetic({ sessionID: proposal.sessionID, text, description: 'Tool review audit', resume: false });
+      const status = outcome === 'allowed' ? 'ALLOWED' : 'BLOCKED';
+      const detail = decision
+        ? `${decision.reason} — ${decision.analysis}`
+        : outcome.replace(/^blocked: Tool review blocked execution: /, '');
+      const description = `Tool review ${status}: ${proposal.tool}${decision ? ` (${decision.risk})` : ''} — ${detail}`
+        .replace(/\s+/g, ' ').slice(0, 500);
+      await ctx.session.synthetic({ sessionID: proposal.sessionID, text, description, resume: false });
     };
     const guard = async (proposal, getContext, verify) => {
       if (closed || configError || active >= options.maxConcurrent) {
@@ -123,7 +129,8 @@ export default {
       // Include effective environment in the local fingerprint, but do not disclose values to a provider.
       const initial = digest(event);
       const { command, cwd, shell, timeout } = event;
-      const proposal = { kind: 'shell', command, cwd, shell, timeout, environmentKeys: Object.keys(event.env).sort() };
+      const proposal = { kind: 'shell', command, cwd, shell, timeout, directory: ctx.location.directory,
+        environmentKeys: Object.keys(event.env).sort() };
       await guard(proposal, async () => ({ userMessages: [],
         limitation: 'Shell hook has no session ID. Environment values are withheld. Require no missing evidence for an allow.' }), () => {
         if (digest(event) !== initial) throw new ReviewDenied('shell changed during review');
