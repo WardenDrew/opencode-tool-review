@@ -1,5 +1,5 @@
 // Explicit integration check. Only ':' (the shell no-op) enters the native API.
-// A final stop hook always throws, so even an allowed review never spawns a shell.
+// User shell calls must bypass plugin review; the fixture stop hook prevents spawns.
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -9,18 +9,18 @@ import assert from 'node:assert/strict';
 
 const root = await mkdtemp(path.join(os.tmpdir(), 'ironwatch-native-'));
 for (const name of ['config', 'data', 'cache', 'state', 'work', 'fixture']) await mkdir(path.join(root, name));
-const decisionFile = path.join(root, 'decision.json');
+const reviewFile = path.join(root, 'reviewed.txt');
 const markerFile = path.join(root, 'stopped.txt');
 const entrypoint = new URL('../index.js', import.meta.url).href;
 await writeFile(path.join(root, 'fixture', 'index.js'), `
 import plugin from ${JSON.stringify(entrypoint)};
-import { readFile, appendFile } from 'node:fs/promises';
+import { appendFile } from 'node:fs/promises';
 export default {
   id: 'ironwatch.native-smoke',
   async setup(ctx) {
     const cleanup = await plugin.setup({ ...ctx,
       options: { model: { providerID: 'fixture', id: 'fixture' } },
-      generate: { text: async () => ({ text: await readFile(${JSON.stringify(decisionFile)}, 'utf8') }) }
+      generate: { text: async () => { await appendFile(${JSON.stringify(reviewFile)}, 'reviewed\\n'); throw new Error('SMOKE_REVIEW_SHOULD_NOT_RUN'); } }
     });
     await ctx.shell.hook('create.before', async () => {
       await appendFile(${JSON.stringify(markerFile)}, 'stopped\\n');
@@ -73,15 +73,16 @@ try {
   };
   assert.ok(await until(active));
   const marker = async () => readFile(markerFile, 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; });
-  for (const decision of ['deny', 'allow', 'deny']) {
-    await writeFile(decisionFile, JSON.stringify({ type: 'decision', decision, risk: 'low', effect: 'read', authorized: true, reason: 'native fixture', analysis: 'The harmless no-op is the only command under review.' }));
+  for (let i = 0; i < 3; i++) {
     const before = await marker();
     const result = await request('/api/shell', { command: ':', cwd: path.join(root, 'work'), timeout: 1000 });
     assert.ok(result.status >= 400, 'Stop hook must prevent native process creation');
-    assert.equal(await marker(), decision === 'allow' ? before + 'stopped\n' : before);
+    assert.equal(await marker(), before + 'stopped\n');
     assert.ok(await active(), 'A rejection must not unload the review plugin');
   }
-  console.log('Native OpenCode 2.0.11: plugin active; deny/allow/deny hooks enforced; no shell spawned.');
+  const reviewed = await readFile(reviewFile, 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; });
+  assert.equal(reviewed, '', 'User shell calls must not enter plugin review');
+  console.log('Native OpenCode 2.0.11: plugin active; user shell calls bypass review; no shell spawned.');
 } finally {
   child.kill('SIGTERM');
   await Promise.race([exited, delay(3000)]);

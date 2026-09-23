@@ -1,15 +1,15 @@
 import path from 'node:path';
-import { deadline, digest, encode, makeReviewer, ReviewDenied } from './reviewer.js';
+import { deadline, encode, makeReviewer, ReviewDenied } from './reviewer.js';
 import { makeInspector } from './evidence.js';
 
 export function configuration(raw) {
-  const allowed = ['model', 'policy', 'maxRisk', 'maxSteps', 'timeoutMs', 'maxConcurrent', 'evidenceFiles'];
+  const allowed = ['model', 'policy', 'maxRisk', 'maxSteps', 'timeoutMs', 'maxConcurrent', 'evidenceFiles', 'tools'];
   if (!raw || Object.keys(raw).some(key => !allowed.includes(key))) throw new Error('Unknown tool-review option');
   const model = raw.model;
   if (!model || typeof model.providerID !== 'string' || !model.providerID.trim() ||
       typeof model.id !== 'string' || !model.id.trim() || Object.keys(model).some(k => !['providerID', 'id'].includes(k)))
     throw new Error('tool-review requires model: { providerID, id }');
-  const value = { model, policy: '', maxRisk: 'medium', maxSteps: 4, timeoutMs: 30_000, maxConcurrent: 4, evidenceFiles: [], ...raw };
+  const value = { model, policy: '', maxRisk: 'medium', maxSteps: 4, timeoutMs: 30_000, maxConcurrent: 4, evidenceFiles: [], tools: ['shell', 'execute'], ...raw };
   if (!['low', 'medium'].includes(value.maxRisk) || typeof value.policy !== 'string' || value.policy.length > 8000)
     throw new Error('Invalid tool-review policy');
   for (const [key, max] of [['maxSteps', 8], ['timeoutMs', 120_000], ['maxConcurrent', 32]])
@@ -17,6 +17,9 @@ export function configuration(raw) {
   if (!Array.isArray(value.evidenceFiles) || value.evidenceFiles.length > 32 || value.evidenceFiles.some(file =>
     typeof file !== 'string' || !file || path.isAbsolute(file) || file.split(/[\\/]/).includes('..')))
     throw new Error('evidenceFiles must contain at most 32 relative file paths');
+  if (!Array.isArray(value.tools) || value.tools.length === 0 || value.tools.length > 32 ||
+      value.tools.some(tool => typeof tool !== 'string' || !tool))
+    throw new Error('tools must contain 1 to 32 non-empty tool names');
   return JSON.parse(encode(value));
 }
 
@@ -43,16 +46,29 @@ export default {
     // Register guards even on bad configuration, so a missing model cannot silently disable review.
     let options, configError;
     try {
-      if (ctx.app.version !== '2.0.11') throw new Error('tool-review has been audited for OpenCode 2.0.11 only');
+      if (!/^2\.0\.\d+(?:[-+].*)?$/.test(ctx.app.version))
+        console.warn(`tool-review supports OpenCode 2.0.x; running on ${ctx.app.version}`);
       options = configuration(ctx.options);
     } catch (error) { configError = error; }
     let active = 0;
     let closed = false;
     const controllers = new Set();
+    const waiters = [];
+    // Saturated capacity queues the review; take runs synchronously inside release, so the cap is exact.
+    const capacity = () => new Promise(resolve => {
+      const take = () => { active++; resolve(); };
+      if (active >= options.maxConcurrent) { waiters.push(take); return; }
+      take();
+    });
+    const release = () => {
+      active--;
+      const next = waiters.shift();
+      if (next) next();
+    };
     const inspect = options && makeInspector(ctx.location.directory, options.evidenceFiles);
     const review = options && makeReviewer({ generate: input => ctx.generate.text(input), inspect, options });
     const audit = async (proposal, steps, outcome) => {
-      if (!proposal.sessionID) return; // The shell hook has no session attribution.
+      if (!proposal.sessionID) return;
       const decision = steps.findLast(step => step.type === 'decision');
       const inspections = steps.filter(step => step.type === 'inspect').map(step => step.file);
       const text = [
@@ -71,20 +87,22 @@ export default {
       await ctx.session.synthetic({ sessionID: proposal.sessionID, text, description, resume: false });
     };
     const guard = async (proposal, getContext, verify) => {
-      if (closed || configError || active >= options.maxConcurrent) {
-        const denied = new ReviewDenied(closed || configError
-          ? 'reviewer unavailable or misconfigured' : 'review capacity exhausted; retry later');
+      if (closed || configError) {
+        const denied = new ReviewDenied('reviewer unavailable or misconfigured');
         try { await audit(proposal, [], `blocked: ${denied.message}`); } catch { /* Preserve the denial. */ }
         throw denied;
       }
-      active++;
       const steps = [];
       const controller = new AbortController();
       controllers.add(controller);
+      // Saturated capacity queues the review behind running ones; the deadline covers the wait.
       // Keep a hung provider counted until it settles, even after the execution deadline expires.
       const work = (async () => {
-        try { return await review(proposal, await getContext(), controller.signal, step => steps.push(step)); }
-        finally { active--; controllers.delete(controller); }
+        try {
+          await capacity();
+          return await review(proposal, await getContext(), controller.signal, step => steps.push(step));
+        }
+        finally { release(); controllers.delete(controller); }
       })();
       try {
         await deadline(() => work, options.timeoutMs);
@@ -105,6 +123,8 @@ export default {
     };
     const registrations = [];
     registrations.push(await ctx.tool.hook('execute.before', async event => {
+      // Only opt-in tools are reviewed; the rest pass without review, audit, or delay.
+      if (options && !options.tools.includes(event.tool)) return;
       const initial = encode({ tool: event.tool, input: event.input });
       const proposal = JSON.parse(initial);
       proposal.kind = 'tool';
@@ -123,18 +143,6 @@ export default {
       }, () => {
         if (encode({ tool: event.tool, input: event.input }) !== initial) throw new ReviewDenied('tool changed during review');
         lock(event, ['tool', 'input']);
-      });
-    }));
-    registrations.push(await ctx.shell.hook('create.before', async event => {
-      // Include effective environment in the local fingerprint, but do not disclose values to a provider.
-      const initial = digest(event);
-      const { command, cwd, shell, timeout } = event;
-      const proposal = { kind: 'shell', command, cwd, shell, timeout, directory: ctx.location.directory,
-        environmentKeys: Object.keys(event.env).sort() };
-      await guard(proposal, async () => ({ userMessages: [],
-        limitation: 'Shell hook has no session ID. Environment values are withheld. Require no missing evidence for an allow.' }), () => {
-        if (digest(event) !== initial) throw new ReviewDenied('shell changed during review');
-        lock(event, ['command', 'cwd', 'shell', 'timeout', 'env']);
       });
     }));
     return async () => {
